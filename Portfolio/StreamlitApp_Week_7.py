@@ -58,7 +58,7 @@ df_features = extract_features()
 MODEL_INFO = {
         "endpoint": aws_endpoint,
         "explainer": 'explainer.shap',
-        "pipeline": 'finalized_model.tar.gz',
+        "pipeline": 'finalized_pair_model.tar.gz',
         "keys": ["MPWR", "AAPL"],
         "inputs": [{"name": k, "type": "number", "min": 0.0, "default": 0.0, "step": 10} for k in ["MPWR", "AAPL"]]
 }
@@ -158,6 +158,7 @@ if submitted:
         display_explanation(input_df,session, aws_bucket)
     else:
         st.error(res)
+
 
 
 
