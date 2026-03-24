@@ -1,77 +1,53 @@
-import numpy as np
-import pandas as pd
 import datetime
+import pandas as pd
 import yfinance as yf
-import pandas_datareader.data as web
-import requests
-#from datetime import datetime, timedelta
-import os
-import sys
-
-import os
-import sys
 
 
-# ... continue with your script ...
-
-def extract_features():
-
-    return_period = 5
-    
-    START_DATE = (datetime.date.today() - datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-    END_DATE = datetime.date.today().strftime("%Y-%m-%d")
-    stk_tickers = ['MPWR', 'AAPL'] #['NVDA', 'AAPL', 'ORCL']
-  #  ccy_tickers = ['DEXCAUS', 'DEXINUS']
-   # idx_tickers = ['NASDAQCOM', 'VXNCLS', 'DGS10']
-    stk_data = yf.download(stk_tickers, start=START_DATE, end=END_DATE, auto_adjust=False)
-    #stk_data = web.DataReader(stk_tickers, 'yahoo')
-    ccy_data = web.DataReader(ccy_tickers, 'fred', start=START_DATE, end=END_DATE)
-    idx_data = web.DataReader(idx_tickers, 'fred', start=START_DATE, end=END_DATE)
-
-  #  Y = np.log(stk_data.loc[:, ('Adj Close', 'MPRWR')]).diff(return_period).shift(-return_period)
-    Y = np.log(stk_data.loc[:, ('Adj Close', 'COST')]).diff(return_period).shift(-return_period)
-    #Y.name = Y.name[-1]+'_Future'
-    Y.name ='AAPL
-
-    X = stk_data.loc[:, ('Adj Close', 'MPWR')]
-    X.name = 'MPWR'
-'
-    #X1 = np.log(stk_data.loc[:, ('Adj Close', ('AAPL', 'ORCL'))]).diff(return_period)
-    #X1.columns = X1.columns.droplevel()
-    #X2 = np.log(ccy_data).diff(return_period)
-    #X3 = np.log(idx_data).diff(return_period)
-
-    X = pd.concat([X1, X2, X3], axis=1)
-    
-    dataset = pd.concat([Y, X], axis=1).dropna()#.iloc[::return_period, :]
-    Y = dataset.loc[:, Y.name]
-    X = dataset.loc[:, X.name]
-    dataset.index.name = 'Date'
-    #dataset.to_csv(r"./test_data.csv")
-    features = dataset.sort_index()
-    features = features.reset_index(drop=True)
-    #features = features.iloc[:,1:]
-    return features
+PAIR_KEYS = ["EMR", "GOOG"]
 
 
-def get_bitcoin_historical_prices(days = 60):
-    
-    BASE_URL = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-    
-    params = {
-        'vs_currency': 'usd',
-        'days': days,
-        'interval': 'daily' # Ensure we get daily granularity
-    }
-    response = requests.get(BASE_URL, params=params)
-    data = response.json()
-    prices = data['prices']
-    df = pd.DataFrame(prices, columns=['Timestamp', 'Close Price (USD)'])
-    df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms').dt.normalize()
-    df = df[['Date', 'Close Price (USD)']].set_index('Date')
-    return df
+def extract_features_pair(
+    tickers: list[str] | None = None,
+    lookback_days: int = 365
+) -> pd.DataFrame:
+    """
+    Download historical adjusted close prices for the deployed pair model.
 
+    Returns a dataframe with raw price columns only, which is what the
+    deployed pipeline expects before PairFeatureEngineer creates rolling features.
+    """
+    if tickers is None:
+        tickers = PAIR_KEYS
 
+    end_date = datetime.date.today()
+    start_date = end_date - datetime.timedelta(days=lookback_days)
 
+    data = yf.download(
+        tickers,
+        start=start_date.strftime("%Y-%m-%d"),
+        end=end_date.strftime("%Y-%m-%d"),
+        auto_adjust=False,
+        progress=False
+    )
 
+    if data.empty:
+        raise ValueError("No price data downloaded from yfinance.")
 
+    # Use Adj Close if available, otherwise Close
+    if isinstance(data.columns, pd.MultiIndex):
+        if "Adj Close" in data.columns.get_level_values(0):
+            prices = data["Adj Close"].copy()
+        elif "Close" in data.columns.get_level_values(0):
+            prices = data["Close"].copy()
+        else:
+            raise ValueError("Expected 'Adj Close' or 'Close' in downloaded data.")
+    else:
+        # Single ticker fallback
+        prices = data[["Adj Close"]].copy()
+        prices.columns = tickers
+
+    prices = prices[tickers].copy()
+    prices = prices.dropna()
+    prices.index.name = "Date"
+
+    return prices.reset_index(drop=True)
