@@ -3,7 +3,6 @@ import sys
 import warnings
 import tarfile
 import tempfile
-import posixpath
 
 import joblib
 import boto3
@@ -28,6 +27,8 @@ project_root = os.path.abspath(os.path.join(current_dir, ".."))
 
 if project_root not in sys.path:
     sys.path.append(project_root)
+
+from src.feature_utils import extract_features_pair
 
 # -----------------------------
 # Streamlit page config
@@ -60,12 +61,12 @@ def get_session(aws_id, aws_secret, aws_token=None):
         kwargs["aws_session_token"] = aws_token
     return boto3.Session(**kwargs)
 
+
 session = get_session(aws_id, aws_secret, aws_token)
 sm_session = sagemaker.Session(boto_session=session)
 
 # -----------------------------
 # Data & Model Configuration
-# Final trained pair = EMR + GOOG
 # -----------------------------
 MODEL_INFO = {
     "endpoint": aws_endpoint,
@@ -82,20 +83,12 @@ MODEL_INFO = {
 
 # -----------------------------
 # Base historical data
-# Avoid yfinance in deployed app
-# Put pair_base_history.csv in the same folder as this app
-# with columns: EMR,GOOG
+# Uses extract_features_pair() as requested
 # -----------------------------
 @st.cache_data
 def load_base_features():
-    csv_path = os.path.join(current_dir, "pair_base_history.csv")
-    df = pd.read_csv(csv_path)
+    return extract_features_pair()
 
-    missing_cols = [c for c in MODEL_INFO["keys"] if c not in df.columns]
-    if missing_cols:
-        raise ValueError(f"Missing expected columns in pair_base_history.csv: {missing_cols}")
-
-    return df[MODEL_INFO["keys"]].copy()
 
 df_features = load_base_features()
 
@@ -111,7 +104,7 @@ def load_pipeline(_session, bucket, prefix):
     s3_client.download_file(
         Bucket=bucket,
         Key=f"{prefix}/{os.path.basename(filename)}",
-        Filename=local_tar_path
+        Filename=local_tar_path,
     )
 
     extract_dir = os.path.join(tempfile.gettempdir(), "pair_model_extract")
@@ -122,7 +115,7 @@ def load_pipeline(_session, bucket, prefix):
         joblib_files = [f for f in tar.getnames() if f.endswith(".joblib")]
 
     if not joblib_files:
-        raise FileNotFoundError("No .joblib file found inside model tar.gz")
+        raise FileNotFoundError("No .joblib file found inside the model tar.gz")
 
     joblib_path = os.path.join(extract_dir, os.path.basename(joblib_files[0]))
     return joblib.load(joblib_path)
@@ -227,11 +220,13 @@ with st.form("pred_form"):
 
     submitted = st.form_submit_button("Run Prediction")
 
+# -----------------------------
+# Inference flow
+# -----------------------------
 if submitted:
     try:
         data_row = [user_inputs[k] for k in MODEL_INFO["keys"]]
 
-        # Prepare data: append the newest row to historical base
         base_df = df_features[MODEL_INFO["keys"]].copy()
         new_row = pd.DataFrame([data_row], columns=MODEL_INFO["keys"])
         input_df = pd.concat([base_df, new_row], ignore_index=True)
