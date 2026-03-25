@@ -1,34 +1,33 @@
 import os
 import sys
 import warnings
-import tempfile
 import tarfile
+import tempfile
 import posixpath
 
-import boto3
 import joblib
-import matplotlib.pyplot as plt
-import pandas as pd
-import sagemaker
+import boto3
 import shap
+import sagemaker
+import pandas as pd
 import streamlit as st
-from sagemaker.deserializers import JSONDeserializer
+import matplotlib.pyplot as plt
+
 from sagemaker.predictor import Predictor
 from sagemaker.serializers import CSVSerializer
+from sagemaker.deserializers import JSONDeserializer
 from sklearn.pipeline import Pipeline
 
+# -----------------------------
+# Setup & Path Configuration
+# -----------------------------
 warnings.simplefilter("ignore")
 
-# -----------------------------
-# Path setup
-# -----------------------------
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, ".."))
 
 if project_root not in sys.path:
     sys.path.append(project_root)
-
-from src.feature_utils import extract_features_pair  # noqa: E402
 
 # -----------------------------
 # Streamlit page config
@@ -37,7 +36,7 @@ st.set_page_config(page_title="Pair Trading Model Deployment", layout="wide")
 st.title("👨‍💻 Pair Trading Model Deployment")
 
 # -----------------------------
-# Secrets / AWS config
+# Access secrets
 # -----------------------------
 aws_creds = st.secrets["aws_credentials"]
 aws_id = aws_creds["AWS_ACCESS_KEY_ID"]
@@ -48,73 +47,73 @@ aws_endpoint = aws_creds["AWS_ENDPOINT"]
 aws_region = aws_creds.get("AWS_REGION", "us-east-1")
 
 # -----------------------------
-# Model config
-# Final trained pair: GOOG + EMR
-# Keep column order consistent everywhere
+# AWS Session Management
+# -----------------------------
+@st.cache_resource
+def get_session(aws_id, aws_secret, aws_token=None):
+    kwargs = {
+        "aws_access_key_id": aws_id,
+        "aws_secret_access_key": aws_secret,
+        "region_name": aws_region,
+    }
+    if aws_token:
+        kwargs["aws_session_token"] = aws_token
+    return boto3.Session(**kwargs)
+
+session = get_session(aws_id, aws_secret, aws_token)
+sm_session = sagemaker.Session(boto_session=session)
+
+# -----------------------------
+# Data & Model Configuration
+# Final trained pair = EMR + GOOG
 # -----------------------------
 MODEL_INFO = {
     "endpoint": aws_endpoint,
     "explainer": "explainer_pair.shap",
     "pipeline": "finalized_pair_model.tar.gz",
-    "pipeline_s3_prefix": "sklearn-pipeline-deployment",
-    "explainer_s3_key": "explainer/explainer_pair.shap",
-    "keys": ["EMR", "GOOG"],  # match final training input columns
+    "pipeline_prefix": "sklearn-pipeline-deployment",
+    "explainer_key": "explainer/explainer_pair.shap",
+    "keys": ["EMR", "GOOG"],
     "inputs": [
-        {"name": "EMR", "type": "number", "min": 0.0, "default": 110.0, "step": 1.0},
+        {"name": "EMR", "type": "number", "min": 0.0, "default": 116.0, "step": 1.0},
         {"name": "GOOG", "type": "number", "min": 0.0, "default": 180.0, "step": 1.0},
     ],
 }
 
 # -----------------------------
-# AWS session
-# -----------------------------
-@st.cache_resource
-def get_session(access_key: str, secret_key: str, session_token: str | None, region: str):
-    kwargs = {
-        "aws_access_key_id": access_key,
-        "aws_secret_access_key": secret_key,
-        "region_name": region,
-    }
-    if session_token:
-        kwargs["aws_session_token"] = session_token
-    return boto3.Session(**kwargs)
-
-
-session = get_session(aws_id, aws_secret, aws_token, aws_region)
-sm_session = sagemaker.Session(boto_session=session)
-
-# -----------------------------
-# Historical base data
-# This should return the raw two-column price history used
-# to append a new observation before scoring.
+# Base historical data
+# Avoid yfinance in deployed app
+# Put pair_base_history.csv in the same folder as this app
+# with columns: EMR,GOOG
 # -----------------------------
 @st.cache_data
-def load_base_features() -> pd.DataFrame:
-    df = extract_features_pair().copy()
+def load_base_features():
+    csv_path = os.path.join(current_dir, "pair_base_history.csv")
+    df = pd.read_csv(csv_path)
+
     missing_cols = [c for c in MODEL_INFO["keys"] if c not in df.columns]
     if missing_cols:
-        raise ValueError(f"extract_features_pair() is missing expected columns: {missing_cols}")
-    return df[MODEL_INFO["keys"]].copy()
+        raise ValueError(f"Missing expected columns in pair_base_history.csv: {missing_cols}")
 
+    return df[MODEL_INFO["keys"]].copy()
 
 df_features = load_base_features()
 
 # -----------------------------
-# Helpers to load artifacts from S3
+# Load pipeline from S3
 # -----------------------------
 @st.cache_resource
-def load_pipeline(_session, bucket: str, s3_prefix: str, tar_filename: str):
+def load_pipeline(_session, bucket, prefix):
     s3_client = _session.client("s3")
-    local_tar_path = os.path.join(tempfile.gettempdir(), tar_filename)
+    filename = MODEL_INFO["pipeline"]
+    local_tar_path = os.path.join(tempfile.gettempdir(), filename)
 
-    # download tar.gz
     s3_client.download_file(
         Bucket=bucket,
-        Key=f"{s3_prefix}/{os.path.basename(tar_filename)}",
-        Filename=local_tar_path,
+        Key=f"{prefix}/{os.path.basename(filename)}",
+        Filename=local_tar_path
     )
 
-    # extract tar.gz to temp folder
     extract_dir = os.path.join(tempfile.gettempdir(), "pair_model_extract")
     os.makedirs(extract_dir, exist_ok=True)
 
@@ -128,22 +127,23 @@ def load_pipeline(_session, bucket: str, s3_prefix: str, tar_filename: str):
     joblib_path = os.path.join(extract_dir, os.path.basename(joblib_files[0]))
     return joblib.load(joblib_path)
 
-
+# -----------------------------
+# Load SHAP explainer from S3
+# -----------------------------
 @st.cache_resource
-def load_shap_explainer(_session, bucket: str, s3_key: str, local_path: str):
+def load_shap_explainer(_session, bucket, key, local_path):
     s3_client = _session.client("s3")
 
     if not os.path.exists(local_path):
-        s3_client.download_file(Bucket=bucket, Key=s3_key, Filename=local_path)
+        s3_client.download_file(Bucket=bucket, Key=key, Filename=local_path)
 
     with open(local_path, "rb") as f:
         return shap.Explainer.load(f)
 
-
 # -----------------------------
-# Endpoint prediction
+# Prediction Logic
 # -----------------------------
-def call_model_api(input_df: pd.DataFrame):
+def call_model_api(input_df):
     predictor = Predictor(
         endpoint_name=MODEL_INFO["endpoint"],
         sagemaker_session=sm_session,
@@ -152,14 +152,11 @@ def call_model_api(input_df: pd.DataFrame):
     )
 
     try:
-        # Send only values; endpoint expects tabular rows
         raw_pred = predictor.predict(input_df.values.tolist())
 
-        # Handle common response formats
         if isinstance(raw_pred, list):
-            pred_val = raw_pred[-1] if len(raw_pred) > 0 else None
+            pred_val = raw_pred[-1] if raw_pred else None
         elif isinstance(raw_pred, dict):
-            # fallback for JSON object response
             pred_val = raw_pred.get("predictions", [None])[-1]
         else:
             pred_val = raw_pred
@@ -174,29 +171,27 @@ def call_model_api(input_df: pd.DataFrame):
     except Exception as e:
         return f"Error: {str(e)}", 500
 
-
 # -----------------------------
-# Local explainability (SHAP)
+# Local Explainability
 # -----------------------------
-def display_explanation(input_df: pd.DataFrame, _session, bucket: str):
+def display_explanation(input_df, _session, bucket):
     explainer = load_shap_explainer(
-        _session=_session,
-        bucket=bucket,
-        s3_key=MODEL_INFO["explainer_s3_key"],
-        local_path=os.path.join(tempfile.gettempdir(), MODEL_INFO["explainer"]),
+        _session,
+        bucket,
+        MODEL_INFO["explainer_key"],
+        os.path.join(tempfile.gettempdir(), MODEL_INFO["explainer"]),
     )
 
     full_pipeline = load_pipeline(
-        _session=_session,
-        bucket=bucket,
-        s3_prefix=MODEL_INFO["pipeline_s3_prefix"],
-        tar_filename=MODEL_INFO["pipeline"],
+        _session,
+        bucket,
+        MODEL_INFO["pipeline_prefix"],
     )
 
-    # Exclude sampler and model; keep preprocessing/feature engineering only
+    # exclude sampler and model
     preprocessing_pipeline = Pipeline(steps=full_pipeline.steps[:-2])
-
     input_df_transformed = preprocessing_pipeline.transform(input_df)
+
     feature_names = full_pipeline.named_steps["feature_selection"].get_feature_names_out()
     input_df_transformed = pd.DataFrame(input_df_transformed, columns=feature_names)
 
@@ -204,7 +199,6 @@ def display_explanation(input_df: pd.DataFrame, _session, bucket: str):
 
     st.subheader("🔍 Decision Transparency (SHAP)")
 
-    # Multiclass-safe indexing
     sample_shap = shap_values[0, :, 0] if len(shap_values.shape) == 3 else shap_values[0]
 
     shap.plots.waterfall(sample_shap, show=False)
@@ -214,20 +208,18 @@ def display_explanation(input_df: pd.DataFrame, _session, bucket: str):
     top_feature = pd.Series(sample_shap.values, index=sample_shap.feature_names).abs().idxmax()
     st.info(f"**Business Insight:** The most influential factor in this decision was **{top_feature}**.")
 
-
 # -----------------------------
-# UI
+# Streamlit UI
 # -----------------------------
-st.subheader("Inputs")
-
 with st.form("pred_form"):
+    st.subheader("Inputs")
     cols = st.columns(2)
     user_inputs = {}
 
     for i, inp in enumerate(MODEL_INFO["inputs"]):
         with cols[i % 2]:
             user_inputs[inp["name"]] = st.number_input(
-                label=inp["name"],
+                inp["name"],
                 min_value=inp["min"],
                 value=inp["default"],
                 step=inp["step"],
@@ -235,33 +227,25 @@ with st.form("pred_form"):
 
     submitted = st.form_submit_button("Run Prediction")
 
-
-# -----------------------------
-# Inference flow
-# -----------------------------
 if submitted:
     try:
-        # Base historical data used by PairFeatureEngineer(window=60)
+        data_row = [user_inputs[k] for k in MODEL_INFO["keys"]]
+
+        # Prepare data: append the newest row to historical base
         base_df = df_features[MODEL_INFO["keys"]].copy()
-
-        # Append the latest user-provided row
-        new_row = pd.DataFrame(
-            [[user_inputs[k] for k in MODEL_INFO["keys"]]],
-            columns=MODEL_INFO["keys"],
-        )
-
+        new_row = pd.DataFrame([data_row], columns=MODEL_INFO["keys"])
         input_df = pd.concat([base_df, new_row], ignore_index=True)
 
-        st.write("### Input Snapshot")
+        st.subheader("Input Snapshot")
         st.dataframe(input_df.tail(5))
 
-        prediction, status = call_model_api(input_df)
+        res, status = call_model_api(input_df)
 
         if status == 200:
-            st.metric("Prediction Result", prediction)
+            st.metric("Prediction Result", res)
             display_explanation(input_df, session, aws_bucket)
         else:
-            st.error(prediction)
+            st.error(res)
 
     except Exception as e:
         st.error(f"Application error: {str(e)}")
