@@ -21,7 +21,9 @@ from sagemaker.deserializers import NumpyDeserializer
 
 from sklearn.pipeline import Pipeline
 import shap
+import matplotlib.pyplot as plt
 
+plt.figure(figsize=(8, 5))  # smaller + cleaner
 # Setup & Path Configuration
 warnings.simplefilter("ignore")
 
@@ -122,8 +124,8 @@ def display_explanation(input_df, session, aws_bucket):
   
     st.subheader("🔍 Decision Transparency (SHAP)")
     fig, ax = plt.subplots(figsize=(10, 4))
-    shap.plots.waterfall(shap_values[0], max_display=10, show=False)
-    st.pyplot(fig)
+    shap.plots.waterfall(shap_values[0], max_display=10)
+    st.pyplot(plt.gcf())
     # top feature 
     top_feature = pd.Series(shap_values[0].values, index=shap_values[0].feature_names).abs().idxmax()
     st.info(f"**Business Insight:** The most influential factor in this decision was **{top_feature}**.")
