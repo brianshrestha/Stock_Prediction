@@ -138,9 +138,9 @@ def display_explanation(input_df, session, aws_bucket):
 
 # Streamlit UI
 st.set_page_config(page_title="NFLX Return Predictor", layout="wide")
-st.title("Ã°Å¸â€œË† NFLX Next-Day Return Predictor")
-st.markdown("**Option 1 Ã¢â‚¬â€ Regression** | Target: NFLX | Model: XGBoost Regressor")
-st.caption("Enter sentiment scores (Lexicon, range -1 to +1) for the four features below.")
+st.title("📈 NFLX Next-Day Return Predictor")
+st.markdown("**Option 1 — Regression** | Target: NFLX | Model: XGBoost Regressor")
+st.caption("Enter sentiment scores (Lexicon, range –1 to +1) for the four features below.")
 
 with st.form("pred_form"):
     st.subheader("Input Sentiment Features")
@@ -165,7 +165,7 @@ if submitted:
     if status == 200:
         # Format as a percentage return
         ret_pct = round(float(res) * 100, 4)
-        direction = "Ã°Å¸â€œË† Positive" if ret_pct > 0 else ("Ã°Å¸â€œâ€° Negative" if ret_pct < 0 else "Ã¢Å¾Â¡Ã¯Â¸Â Flat")
+        direction = "Ã°Å¸â€œË† Positive" if ret_pct > 0 else ("📉 Negative" if ret_pct < 0 else "➡️ Flat")
         st.metric("Predicted Next-Day Return", f"{ret_pct:+.4f}%", delta=f"{direction}")
         display_explanation(input_df, session, aws_bucket)
     else:
