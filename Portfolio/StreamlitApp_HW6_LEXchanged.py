@@ -126,7 +126,7 @@ def display_explanation(input_df, session, aws_bucket):
     input_df_transformed = pd.DataFrame(input_df_transformed, columns=feature_names)
     shap_values = explainer(input_df_transformed)
     
-    st.subheader("Ã°Å¸â€Â Decision Transparency (SHAP)")
+    st.subheader("🔍 Decision Transparency (SHAP)")
     fig, ax = plt.subplots(figsize=(10, 4))
     # For regression (single output), shap_values[0] is a single Explanation object
     shap.plots.waterfall(shap_values[0])
