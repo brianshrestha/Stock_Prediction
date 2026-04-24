@@ -165,7 +165,7 @@ if submitted:
     if status == 200:
         # Format as a percentage return
         ret_pct = round(float(res) * 100, 4)
-        direction = "Ã°Å¸â€œË† Positive" if ret_pct > 0 else ("📉 Negative" if ret_pct < 0 else "➡️ Flat")
+        direction = "📈 Positive" if ret_pct > 0 else ("📉 Negative" if ret_pct < 0 else "➡️ Flat")
         st.metric("Predicted Next-Day Return", f"{ret_pct:+.4f}%", delta=f"{direction}")
         display_explanation(input_df, session, aws_bucket)
     else:
