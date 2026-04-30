@@ -265,6 +265,13 @@ def local_score(frame: pd.DataFrame, model_bundle, threshold: float) -> pd.DataF
 
 st.set_page_config(page_title="IEEE Fraud Detection", layout="wide")
 
+st.write("bucket:", _secret2("aws_credentials", "AWS_BUCKET"))
+st.write("explainer:", _secret2("aws_credentials", "EXPLAINER_KEY"))
+st.write("pipeline:", _secret2("aws_credentials", "PIPELINE_KEY"))
+
+summary = load_summary()
+top_features = load_top_features()
+
 summary = load_summary()
 top_features = load_top_features()
 
