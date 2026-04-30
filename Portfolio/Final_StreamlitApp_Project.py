@@ -1,3 +1,5 @@
+st.write("USE_SAGEMAKER:", USE_SAGEMAKER)
+st.write("endpoint:", _secret("SAGEMAKER_ENDPOINT"), _secret2("aws_credentials", "AWS_ENDPOINT"))
 from __future__ import annotations
 
 import json
