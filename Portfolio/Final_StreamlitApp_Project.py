@@ -1,5 +1,3 @@
-st.write("USE_SAGEMAKER:", USE_SAGEMAKER)
-st.write("endpoint:", _secret("SAGEMAKER_ENDPOINT"), _secret2("aws_credentials", "AWS_ENDPOINT"))
 from __future__ import annotations
 
 import json
@@ -31,8 +29,6 @@ MODEL_PATH = next((p for p in MODEL_PATH_CANDIDATES if p.exists()), MODEL_PATH_C
 SUMMARY_PATH = ROOT / "final_outputs" / "final_summary.json"
 TOP_FEATURES_PATH = ROOT / "final_outputs" / "final_top_features.csv"
 PREDICTIONS_PATH = ROOT / "final_outputs" / "professor_test_predictions.csv"
-SHAP_BAR_PATH = ROOT / "final_figures" / "shap_bar.png"
-SHAP_WATERFALL_PATH = ROOT / "final_figures" / "shap_waterfall.png"
 
 
 def _secret(key: str, default=None):
@@ -51,9 +47,7 @@ def _secret2(group: str, key: str, default=None):
     return _secret(key, default)
 
 
-USE_SAGEMAKER = bool(
-    _secret("SAGEMAKER_ENDPOINT") or _secret2("aws_credentials", "AWS_ENDPOINT")
-)
+USE_SAGEMAKER = bool(_secret("SAGEMAKER_ENDPOINT") or _secret2("aws_credentials", "AWS_ENDPOINT"))
 
 
 @st.cache_resource
@@ -68,6 +62,7 @@ def load_runtime_client():
     endpoint = _secret("SAGEMAKER_ENDPOINT") or _secret2("aws_credentials", "AWS_ENDPOINT")
     if not endpoint:
         return None, None
+
     region = _secret("AWS_DEFAULT_REGION", "us-east-1")
     runtime = boto3.client(
         "sagemaker-runtime",
@@ -100,6 +95,9 @@ def load_pipeline_from_s3():
     bucket = _secret2("aws_credentials", "AWS_BUCKET")
     key = _secret2("aws_credentials", "PIPELINE_KEY", "fraud-pipeline-deployment/finalized_fraud_model.tar.gz")
 
+    if not bucket:
+        raise RuntimeError("Missing AWS_BUCKET in secrets.")
+
     local_tar = os.path.join(tempfile.gettempdir(), "fraud_pipeline.tar.gz")
     s3.download_file(bucket, key, local_tar)
 
@@ -116,6 +114,9 @@ def load_explainer_from_s3():
     s3 = sess.client("s3")
     bucket = _secret2("aws_credentials", "AWS_BUCKET")
     key = _secret2("aws_credentials", "EXPLAINER_KEY", "explainer/explainer_kpca.shap")
+
+    if not bucket:
+        raise RuntimeError("Missing AWS_BUCKET in secrets.")
 
     local_path = os.path.join(tempfile.gettempdir(), "fraud_explainer.shap")
     s3.download_file(bucket, key, local_path)
@@ -259,6 +260,7 @@ st.set_page_config(page_title="IEEE Fraud Detection", layout="wide")
 summary = load_summary()
 top_features = load_top_features()
 
+# Only load local model in local mode
 bundle = None
 if not USE_SAGEMAKER:
     bundle = load_model_bundle()
@@ -274,7 +276,7 @@ else:
 st.title("IEEE-CIS Fraud Detection")
 st.caption("Final project Streamlit demo using professor-provided transaction files.")
 
-# Static model-quality metrics (like HW6)
+# Static held-out metrics
 metric_cols = st.columns(4)
 metric_cols[0].metric("Held-Out ROC-AUC", f"{summary['holdout_metrics']['roc_auc']:.3f}")
 metric_cols[1].metric("Held-Out PR-AUC", f"{summary['holdout_metrics']['pr_auc']:.3f}")
@@ -299,21 +301,9 @@ if input_df.empty:
     st.warning("No input rows found. Upload a CSV or add test_transaction.csv to app data.")
     st.stop()
 
-scored = None
-backend_used = None
-
 if USE_SAGEMAKER:
-    try:
-        scored = endpoint_score(input_df, threshold)
-        backend_used = "SageMaker endpoint"
-    except Exception as e:
-        if bundle is not None:
-            st.warning(f"SageMaker failed, falling back to local model: {type(e).__name__}")
-            scored = local_score(input_df, bundle, threshold)
-            backend_used = f"Local model fallback ({MODEL_PATH.name})"
-        else:
-            st.error(f"SageMaker failed: {e}")
-            st.stop()
+    scored = endpoint_score(input_df, threshold)
+    backend_used = "SageMaker endpoint"
 else:
     scored = local_score(input_df, bundle, threshold)
     backend_used = f"Local model ({MODEL_PATH.name})"
@@ -335,56 +325,48 @@ with right:
     st.metric("Flagged", f"{int(scored['flag_for_review'].sum()):,}")
     st.metric("Alert rate", f"{scored['flag_for_review'].mean():.1%}")
 
-# HW6-style row-level SHAP
+# SHAP on-demand (slow)
 st.subheader("Decision Transparency (SHAP)")
 row_idx = st.number_input("Row index to explain", min_value=0, max_value=len(input_df)-1, value=0, step=1)
+run_shap = st.checkbox("Generate SHAP explanation (slow)", value=False)
 
-try:
-    pipe = load_pipeline_from_s3()
-    explainer = load_explainer_from_s3()
+if run_shap:
+    try:
+        pipe = load_pipeline_from_s3()
+        explainer = load_explainer_from_s3()
 
-    x_row = add_features(input_df.iloc[[row_idx]].copy())
+        x_row = add_features(input_df.iloc[[row_idx]].copy())
 
-    pre = pipe.named_steps.get("preprocess") if hasattr(pipe, "named_steps") else None
-    if pre is None:
-        st.info("Pipeline preprocessor step not found for SHAP.")
-    else:
-        req = getattr(pre, "feature_names_in_", None)
-        if req is not None:
-            for c in req:
-                if c not in x_row.columns:
-                    x_row[c] = np.nan
-            x_row = x_row.loc[:, req]
+        pre = pipe.named_steps.get("preprocess") if hasattr(pipe, "named_steps") else None
+        if pre is None:
+            st.info("Pipeline preprocessor step not found for SHAP.")
+        else:
+            req = getattr(pre, "feature_names_in_", None)
+            if req is not None:
+                for c in req:
+                    if c not in x_row.columns:
+                        x_row[c] = np.nan
+                x_row = x_row.loc[:, req]
 
-        x_trans = pre.transform(x_row)
-        x_trans = x_trans.toarray() if hasattr(x_trans, "toarray") else x_trans
+            x_trans = pre.transform(x_row)
+            x_trans = x_trans.toarray() if hasattr(x_trans, "toarray") else x_trans
 
-        shap_values = explainer(x_trans)
+            shap_values = explainer(x_trans)
 
-        fig = plt.figure(figsize=(11, 5))
-        shap.plots.waterfall(shap_values[0], max_display=12, show=False)
-        st.pyplot(fig, clear_figure=True)
-except Exception as e:
-    st.info(f"SHAP unavailable: {e}")
+            fig = plt.figure(figsize=(11, 5))
+            shap.plots.waterfall(shap_values[0], max_display=12, show=False)
+            st.pyplot(fig, clear_figure=True)
+    except Exception as e:
+        st.info(f"SHAP unavailable: {e}")
+else:
+    st.info("Enable SHAP checkbox to compute row-level explanation.")
 
 st.subheader("Top Model Drivers")
 st.dataframe(top_features, use_container_width=True, hide_index=True)
 
-st.subheader("SHAP Static Images")
-if SHAP_WATERFALL_PATH.exists():
-    st.image(str(SHAP_WATERFALL_PATH), caption="Local SHAP waterfall plot")
-if SHAP_BAR_PATH.exists():
-    st.image(str(SHAP_BAR_PATH), caption="Global SHAP feature importance")
-if not SHAP_WATERFALL_PATH.exists() and not SHAP_BAR_PATH.exists():
-    st.info("SHAP images not found; showing fallback plot.")
-    if not top_features.empty:
-        fig, ax = plt.subplots(figsize=(8, 5))
-        plot_data = top_features.head(10).sort_values("importance_mean")
-        ax.barh(plot_data["feature"], plot_data["importance_mean"], color="#2f6f73")
-        ax.set_xlabel("Permutation importance")
-        ax.set_title("Fallback explanation: top features")
-        st.pyplot(fig)
-
 st.subheader("Batch Predictions File")
-st.write("USE_SAGEMAKER:", USE_SAGEMAKER)
 st.write(f"Saved professor test predictions: `{PREDICTIONS_PATH}`")
+
+# Debug (keep at bottom)
+st.write("USE_SAGEMAKER:", USE_SAGEMAKER)
+st.write("endpoint:", _secret("SAGEMAKER_ENDPOINT"), _secret2("aws_credentials", "AWS_ENDPOINT"))
