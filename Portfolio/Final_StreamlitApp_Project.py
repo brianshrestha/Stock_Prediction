@@ -15,7 +15,13 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR_CANDIDATES = [ROOT, ROOT / "data"]
 DATA_DIR = next((p for p in DATA_DIR_CANDIDATES if (p / "test_transaction.csv").exists()), ROOT)
 
-MODEL_PATH = ROOT / "final_models" / "finalized_fraud_model.joblib"
+MODEL_PATH_CANDIDATES = [
+    ROOT / "final_models" / "finalized_fraud_model.joblib",
+    ROOT / "model_skl12.joblib",
+    ROOT / "model.joblib",
+]
+MODEL_PATH = next((p for p in MODEL_PATH_CANDIDATES if p.exists()), MODEL_PATH_CANDIDATES[0])
+
 SUMMARY_PATH = ROOT / "final_outputs" / "final_summary.json"
 TOP_FEATURES_PATH = ROOT / "final_outputs" / "final_top_features.csv"
 PREDICTIONS_PATH = ROOT / "final_outputs" / "professor_test_predictions.csv"
@@ -124,26 +130,21 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _parse_endpoint_scores(raw: str) -> list[float]:
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict) and "predictions" in parsed:
-            preds = parsed["predictions"]
-            if preds and isinstance(preds[0], dict):
-                return [float(p.get("score", p.get("probability", 0.0))) for p in preds]
-            return [float(x) for x in preds]
-        if isinstance(parsed, list):
-            out = []
-            for x in parsed:
-                if isinstance(x, dict):
-                    out.append(float(x.get("score", x.get("probability", 0.0))))
-                else:
-                    out.append(float(x))
-            return out
-    except Exception:
-        pass
-
-    parts = [p for p in raw.replace("\n", ",").split(",") if p.strip()]
-    return [float(x) for x in parts]
+    parsed = json.loads(raw)
+    if isinstance(parsed, dict) and "predictions" in parsed:
+        preds = parsed["predictions"]
+        if preds and isinstance(preds[0], dict):
+            return [float(p.get("fraud_score", p.get("score", p.get("probability", 0.0)))) for p in preds]
+        return [float(x) for x in preds]
+    if isinstance(parsed, list):
+        out = []
+        for x in parsed:
+            if isinstance(x, dict):
+                out.append(float(x.get("fraud_score", x.get("score", x.get("probability", 0.0)))))
+            else:
+                out.append(float(x))
+        return out
+    raise ValueError("Unexpected endpoint response format")
 
 
 def endpoint_score(frame: pd.DataFrame, threshold: float) -> pd.DataFrame:
@@ -171,15 +172,28 @@ def endpoint_score(frame: pd.DataFrame, threshold: float) -> pd.DataFrame:
     return scored
 
 
-def local_score(frame: pd.DataFrame, model_bundle: dict, threshold: float) -> pd.DataFrame:
-    feature_columns = model_bundle["feature_columns"]
-    model = model_bundle["model"]
+def local_score(frame: pd.DataFrame, model_bundle, threshold: float) -> pd.DataFrame:
     enriched = add_features(frame)
-    X = enriched.reindex(columns=feature_columns)
+
+    # bundle style
+    if isinstance(model_bundle, dict) and "model" in model_bundle:
+        feature_columns = model_bundle.get("feature_columns")
+        model = model_bundle["model"]
+        if feature_columns:
+            X = enriched.reindex(columns=feature_columns)
+        else:
+            X = enriched
+        local_threshold = float(model_bundle.get("threshold", threshold))
+    else:
+        # plain sklearn estimator / pipeline
+        model = model_bundle
+        X = enriched
+        local_threshold = threshold
+
     scores = model.predict_proba(X)[:, 1]
     scored = frame.copy()
     scored["fraud_score"] = scores
-    scored["flag_for_review"] = scores >= threshold
+    scored["flag_for_review"] = scores >= local_threshold
     return scored
 
 
@@ -192,7 +206,7 @@ bundle = load_model_bundle()
 if USE_SAGEMAKER:
     st.success("Using SageMaker endpoint scoring.")
 elif bundle is not None:
-    st.info("Using local model scoring.")
+    st.info(f"Using local model scoring: {MODEL_PATH.name}")
 else:
     st.error("No scoring backend available. Add SageMaker secrets or include local model file.")
     st.stop()
@@ -206,7 +220,10 @@ metric_cols[1].metric("Held-Out PR-AUC", f"{summary['holdout_metrics']['pr_auc']
 metric_cols[2].metric("Precision", f"{summary['holdout_metrics']['precision']:.1%}")
 metric_cols[3].metric("Recall", f"{summary['holdout_metrics']['recall']:.1%}")
 
-default_threshold = float(bundle["threshold"]) if bundle is not None and "threshold" in bundle else 0.5
+default_threshold = 0.5
+if isinstance(bundle, dict) and "threshold" in bundle:
+    default_threshold = float(bundle["threshold"])
+
 threshold = st.sidebar.slider("Fraud alert threshold", 0.05, 0.90, default_threshold, 0.05)
 
 uploaded = st.sidebar.file_uploader("Upload transaction CSV", type=["csv"])
@@ -221,11 +238,27 @@ if input_df.empty:
     st.warning("No input rows found. Upload a CSV or add test_transaction.csv to app data.")
     st.stop()
 
-try:
-    scored = endpoint_score(input_df, threshold) if USE_SAGEMAKER else local_score(input_df, bundle, threshold)
-except Exception as e:
-    st.error(f"SageMaker scoring failed: {type(e).__name__}: {e}")
-    st.stop()
+# Auto-fallback logic
+scored = None
+backend_used = None
+
+if USE_SAGEMAKER:
+    try:
+        scored = endpoint_score(input_df, threshold)
+        backend_used = "SageMaker endpoint"
+    except Exception as e:
+        st.warning(f"SageMaker failed, falling back to local model: {type(e).__name__}")
+        if bundle is not None:
+            scored = local_score(input_df, bundle, threshold)
+            backend_used = f"Local model fallback ({MODEL_PATH.name})"
+        else:
+            st.error(f"SageMaker failed and no local model is available: {e}")
+            st.stop()
+else:
+    scored = local_score(input_df, bundle, threshold)
+    backend_used = f"Local model ({MODEL_PATH.name})"
+
+st.info(f"Scoring backend: {backend_used}")
 
 left, right = st.columns([2, 1])
 with left:
