@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
+import boto3
 import joblib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,34 +13,72 @@ import streamlit as st
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_DIR_CANDIDATES = [ROOT, ROOT / "data", Path("/Users/brian/Downloads")]
+DATA_DIR_CANDIDATES = [ROOT, ROOT / "data"]
 DATA_DIR = next((p for p in DATA_DIR_CANDIDATES if (p / "test_transaction.csv").exists()), ROOT)
-MODEL_PATH = ROOT / "final_models/finalized_fraud_model.joblib"
-SUMMARY_PATH = ROOT / "final_outputs/final_summary.json"
-TOP_FEATURES_PATH = ROOT / "final_outputs/final_top_features.csv"
-PREDICTIONS_PATH = ROOT / "final_outputs/professor_test_predictions.csv"
-SHAP_BAR_PATH = ROOT / "final_figures/shap_bar.png"
-SHAP_WATERFALL_PATH = ROOT / "final_figures/shap_waterfall.png"
+
+MODEL_PATH = ROOT / "final_models" / "finalized_fraud_model.joblib"
+SUMMARY_PATH = ROOT / "final_outputs" / "final_summary.json"
+TOP_FEATURES_PATH = ROOT / "final_outputs" / "final_top_features.csv"
+PREDICTIONS_PATH = ROOT / "final_outputs" / "professor_test_predictions.csv"
+SHAP_BAR_PATH = ROOT / "final_figures" / "shap_bar.png"
+SHAP_WATERFALL_PATH = ROOT / "final_figures" / "shap_waterfall.png"
+
+
+def _secret(key: str, default=None):
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+USE_SAGEMAKER = bool(_secret("SAGEMAKER_ENDPOINT"))
 
 
 @st.cache_resource
 def load_model_bundle():
+    if not MODEL_PATH.exists():
+        return None
     return joblib.load(MODEL_PATH)
+
+
+@st.cache_resource
+def load_runtime_client():
+    endpoint = _secret("SAGEMAKER_ENDPOINT")
+    if not endpoint:
+        return None, None
+    region = _secret("AWS_DEFAULT_REGION", "us-east-1")
+    runtime = boto3.client(
+        "sagemaker-runtime",
+        region_name=region,
+        aws_access_key_id=_secret("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=_secret("AWS_SECRET_ACCESS_KEY"),
+        aws_session_token=_secret("AWS_SESSION_TOKEN"),
+    )
+    return runtime, endpoint
 
 
 @st.cache_data
 def load_summary():
-    return json.loads(SUMMARY_PATH.read_text())
+    if SUMMARY_PATH.exists():
+        return json.loads(SUMMARY_PATH.read_text())
+    return {
+        "holdout_metrics": {"roc_auc": 0.0, "pr_auc": 0.0, "precision": 0.0, "recall": 0.0}
+    }
 
 
 @st.cache_data
 def load_top_features():
-    return pd.read_csv(TOP_FEATURES_PATH).head(15)
+    if TOP_FEATURES_PATH.exists():
+        return pd.read_csv(TOP_FEATURES_PATH).head(15)
+    return pd.DataFrame({"feature": [], "importance_mean": []})
 
 
 @st.cache_data
 def load_professor_sample():
-    return pd.read_csv(DATA_DIR / "test_transaction.csv").sample(250, random_state=42).reset_index(drop=True)
+    p = DATA_DIR / "test_transaction.csv"
+    if not p.exists():
+        return pd.DataFrame()
+    return pd.read_csv(p).sample(250, random_state=42).reset_index(drop=True)
 
 
 def add_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -86,7 +126,26 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def score_transactions(frame: pd.DataFrame, model_bundle: dict, threshold: float) -> pd.DataFrame:
+def endpoint_score(frame: pd.DataFrame, threshold: float):
+    runtime, endpoint = load_runtime_client()
+    if runtime is None:
+        raise RuntimeError("SageMaker endpoint config missing in Streamlit secrets.")
+    payload = frame.to_dict(orient="records")
+    resp = runtime.invoke_endpoint(
+        EndpointName=endpoint,
+        ContentType="application/json",
+        Body=json.dumps(payload),
+    )
+    body = json.loads(resp["Body"].read().decode("utf-8"))
+    scores = np.array(body if isinstance(body, list) else body.get("scores", []), dtype=float)
+
+    scored = frame.copy()
+    scored["fraud_score"] = scores
+    scored["flag_for_review"] = scores >= threshold
+    return scored
+
+
+def local_score(frame: pd.DataFrame, model_bundle: dict, threshold: float):
     feature_columns = model_bundle["feature_columns"]
     model = model_bundle["model"]
     enriched = add_features(frame)
@@ -100,12 +159,20 @@ def score_transactions(frame: pd.DataFrame, model_bundle: dict, threshold: float
 
 st.set_page_config(page_title="IEEE Fraud Detection", layout="wide")
 
-bundle = load_model_bundle()
 summary = load_summary()
 top_features = load_top_features()
 
+bundle = load_model_bundle()
+if USE_SAGEMAKER:
+    st.success("Using SageMaker endpoint scoring.")
+elif bundle is not None:
+    st.info("Using local model scoring.")
+else:
+    st.error("No scoring backend available. Add SageMaker secrets or include local model file.")
+    st.stop()
+
 st.title("IEEE-CIS Fraud Detection")
-st.caption("Final project Streamlit demo using the professor-provided transaction files.")
+st.caption("Final project Streamlit demo using professor-provided transaction files.")
 
 metric_cols = st.columns(4)
 metric_cols[0].metric("Held-Out ROC-AUC", f"{summary['holdout_metrics']['roc_auc']:.3f}")
@@ -113,13 +180,8 @@ metric_cols[1].metric("Held-Out PR-AUC", f"{summary['holdout_metrics']['pr_auc']
 metric_cols[2].metric("Precision", f"{summary['holdout_metrics']['precision']:.1%}")
 metric_cols[3].metric("Recall", f"{summary['holdout_metrics']['recall']:.1%}")
 
-threshold = st.sidebar.slider(
-    "Fraud alert threshold",
-    min_value=0.05,
-    max_value=0.90,
-    value=float(bundle["threshold"]),
-    step=0.05,
-)
+default_threshold = float(bundle["threshold"]) if bundle is not None and "threshold" in bundle else 0.5
+threshold = st.sidebar.slider("Fraud alert threshold", 0.05, 0.90, default_threshold, 0.05)
 
 uploaded = st.sidebar.file_uploader("Upload transaction CSV", type=["csv"])
 if uploaded is not None:
@@ -129,7 +191,14 @@ else:
     input_df = load_professor_sample()
     label = "Sample from professor test transactions"
 
-scored = score_transactions(input_df, bundle, threshold)
+if input_df.empty:
+    st.warning("No input rows found. Upload a CSV or add `test_transaction.csv` to app data.")
+    st.stop()
+
+if USE_SAGEMAKER:
+    scored = endpoint_score(input_df, threshold)
+else:
+    scored = local_score(input_df, bundle, threshold)
 
 left, right = st.columns([2, 1])
 with left:
@@ -147,17 +216,18 @@ st.dataframe(top_features, use_container_width=True, hide_index=True)
 
 st.subheader("SHAP Explanation")
 if SHAP_WATERFALL_PATH.exists():
-    st.image(str(SHAP_WATERFALL_PATH), caption="Local SHAP waterfall plot for one transaction")
+    st.image(str(SHAP_WATERFALL_PATH), caption="Local SHAP waterfall plot")
 if SHAP_BAR_PATH.exists():
     st.image(str(SHAP_BAR_PATH), caption="Global SHAP feature importance")
 if not SHAP_WATERFALL_PATH.exists() and not SHAP_BAR_PATH.exists():
-    st.info("Run the SHAP cell in the notebook first to create the SHAP screenshots for the app.")
-    fig, ax = plt.subplots(figsize=(8, 5))
-    plot_data = top_features.head(10).sort_values("importance_mean")
-    ax.barh(plot_data["feature"], plot_data["importance_mean"], color="#2f6f73")
-    ax.set_xlabel("Permutation importance")
-    ax.set_title("Fallback explanation: top features")
-    st.pyplot(fig)
+    st.info("SHAP images not found; showing fallback plot.")
+    if not top_features.empty:
+        fig, ax = plt.subplots(figsize=(8, 5))
+        plot_data = top_features.head(10).sort_values("importance_mean")
+        ax.barh(plot_data["feature"], plot_data["importance_mean"], color="#2f6f73")
+        ax.set_xlabel("Permutation importance")
+        ax.set_title("Fallback explanation: top features")
+        st.pyplot(fig)
 
 st.subheader("Batch Predictions File")
 st.write(f"Saved professor test predictions: `{PREDICTIONS_PATH}`")
