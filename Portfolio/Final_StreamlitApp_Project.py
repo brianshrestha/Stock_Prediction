@@ -56,20 +56,23 @@ def load_model_bundle():
         return None
     return joblib.load(MODEL_PATH)
 
-
 @st.cache_resource
 def load_runtime_client():
     endpoint = _secret("SAGEMAKER_ENDPOINT") or _secret2("aws_credentials", "AWS_ENDPOINT")
     if not endpoint:
         return None, None
 
-    region = _secret("AWS_DEFAULT_REGION", "us-east-1")
+    region = _secret("AWS_DEFAULT_REGION", "us-east-1") or _secret2("aws_credentials", "AWS_DEFAULT_REGION", "us-east-1")
+    aws_id = _secret("AWS_ACCESS_KEY_ID") or _secret2("aws_credentials", "AWS_ACCESS_KEY_ID")
+    aws_secret = _secret("AWS_SECRET_ACCESS_KEY") or _secret2("aws_credentials", "AWS_SECRET_ACCESS_KEY")
+    aws_token = _secret("AWS_SESSION_TOKEN") or _secret2("aws_credentials", "AWS_SESSION_TOKEN")
+
     runtime = boto3.client(
         "sagemaker-runtime",
         region_name=region,
-        aws_access_key_id=_secret("AWS_ACCESS_KEY_ID"),
-        aws_secret_access_key=_secret("AWS_SECRET_ACCESS_KEY"),
-        aws_session_token=_secret("AWS_SESSION_TOKEN"),
+        aws_access_key_id=aws_id,
+        aws_secret_access_key=aws_secret,
+        aws_session_token=aws_token,
     )
     return runtime, endpoint
 
