@@ -352,14 +352,17 @@ if run_shap:
         st.info("SHAP explainer not configured. Add EXPLAINER_KEY in Streamlit secrets.")
     else:
         try:
-            pipe = load_pipeline_from_s3()
+            
+            bundle_or_pipe = load_pipeline_from_s3()
             explainer = load_explainer_from_s3()
-
+            
+            pipe = bundle_or_pipe["model"] if isinstance(bundle_or_pipe, dict) and "model" in bundle_or_pipe else bundle_or_pipe
+            
             x_row = add_features(input_df.iloc[[row_idx]].copy())
-
+            
             pre = pipe.named_steps.get("preprocess") if hasattr(pipe, "named_steps") else None
             if pre is None:
-                st.info("Pipeline preprocessor step not found for SHAP.")
+                st.info(f"Pipeline preprocessor step not found for SHAP. Loaded type: {type(pipe)}")
             else:
                 req = getattr(pre, "feature_names_in_", None)
                 if req is not None:
