@@ -1,0 +1,32 @@
+{
+  "raw_train_rows": 10000,
+  "raw_test_rows": 10000,
+  "feature_count": 437,
+  "fraud_rate": 0.0265,
+  "train_rows": 6000,
+  "validation_rows": 2000,
+  "holdout_rows": 2000,
+  "final_model": "HistGradientBoosting_Balanced",
+  "best_params": {
+    "model__l2_regularization": 0.1,
+    "model__learning_rate": 0.08,
+    "model__max_iter": 160,
+    "model__max_leaf_nodes": 31
+  },
+  "chosen_threshold": 0.25,
+  "holdout_metrics": {
+    "roc_auc": 0.9261466600769447,
+    "pr_auc": 0.7429029595360375,
+    "accuracy": 0.9845,
+    "precision": 0.6964285714285714,
+    "recall": 0.7358490566037735,
+    "f1": 0.7155963302752294,
+    "alert_rate": 0.028
+  },
+  "confusion_matrix": {
+    "tn": 1930,
+    "fp": 17,
+    "fn": 14,
+    "tp": 39
+  }
+}
