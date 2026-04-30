@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
+import tarfile
+import tempfile
 from pathlib import Path
 
 import boto3
@@ -8,6 +11,7 @@ import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import shap
 import streamlit as st
 
 
@@ -22,6 +26,7 @@ MODEL_PATH_CANDIDATES = [
 ]
 MODEL_PATH = next((p for p in MODEL_PATH_CANDIDATES if p.exists()), MODEL_PATH_CANDIDATES[0])
 
+SUMMARY_PATH = ROOT / "final_outputs" / "final_summary.json"
 TOP_FEATURES_PATH = ROOT / "final_outputs" / "final_top_features.csv"
 PREDICTIONS_PATH = ROOT / "final_outputs" / "professor_test_predictions.csv"
 SHAP_BAR_PATH = ROOT / "final_figures" / "shap_bar.png"
@@ -33,6 +38,15 @@ def _secret(key: str, default=None):
         return st.secrets.get(key, default)
     except Exception:
         return default
+
+
+def _secret2(group: str, key: str, default=None):
+    try:
+        if group in st.secrets and key in st.secrets[group]:
+            return st.secrets[group][key]
+    except Exception:
+        pass
+    return _secret(key, default)
 
 
 USE_SAGEMAKER = bool(_secret("SAGEMAKER_ENDPOINT"))
@@ -59,6 +73,56 @@ def load_runtime_client():
         aws_session_token=_secret("AWS_SESSION_TOKEN"),
     )
     return runtime, endpoint
+
+
+@st.cache_resource
+def get_boto_session():
+    aws_id = _secret2("aws_credentials", "AWS_ACCESS_KEY_ID")
+    aws_secret = _secret2("aws_credentials", "AWS_SECRET_ACCESS_KEY")
+    aws_token = _secret2("aws_credentials", "AWS_SESSION_TOKEN")
+    region = _secret2("aws_credentials", "AWS_DEFAULT_REGION", _secret("AWS_DEFAULT_REGION", "us-east-1"))
+    return boto3.Session(
+        aws_access_key_id=aws_id,
+        aws_secret_access_key=aws_secret,
+        aws_session_token=aws_token,
+        region_name=region,
+    )
+
+
+@st.cache_resource
+def load_pipeline_from_s3():
+    sess = get_boto_session()
+    s3 = sess.client("s3")
+    bucket = _secret2("aws_credentials", "AWS_BUCKET")
+    key = _secret2("aws_credentials", "PIPELINE_KEY", "fraud-pipeline-deployment/finalized_fraud_model.tar.gz")
+
+    local_tar = os.path.join(tempfile.gettempdir(), "fraud_pipeline.tar.gz")
+    s3.download_file(bucket, key, local_tar)
+
+    with tarfile.open(local_tar, "r:gz") as tar:
+        tar.extractall(path=tempfile.gettempdir())
+        joblib_name = [n for n in tar.getnames() if n.endswith(".joblib")][0]
+
+    return joblib.load(os.path.join(tempfile.gettempdir(), joblib_name))
+
+
+@st.cache_resource
+def load_explainer_from_s3():
+    sess = get_boto_session()
+    s3 = sess.client("s3")
+    bucket = _secret2("aws_credentials", "AWS_BUCKET")
+    key = _secret2("aws_credentials", "EXPLAINER_KEY", "explainer/explainer_kpca.shap")
+
+    local_path = os.path.join(tempfile.gettempdir(), "fraud_explainer.shap")
+    s3.download_file(bucket, key, local_path)
+    return joblib.load(local_path)
+
+
+@st.cache_data
+def load_summary():
+    if SUMMARY_PATH.exists():
+        return json.loads(SUMMARY_PATH.read_text())
+    return {"holdout_metrics": {"roc_auc": 0.0, "pr_auc": 0.0, "precision": 0.0, "recall": 0.0}}
 
 
 @st.cache_data
@@ -188,6 +252,7 @@ def local_score(frame: pd.DataFrame, model_bundle, threshold: float) -> pd.DataF
 
 st.set_page_config(page_title="IEEE Fraud Detection", layout="wide")
 
+summary = load_summary()
 top_features = load_top_features()
 
 bundle = None
@@ -204,6 +269,13 @@ else:
 
 st.title("IEEE-CIS Fraud Detection")
 st.caption("Final project Streamlit demo using professor-provided transaction files.")
+
+# Static model-quality metrics (like HW6)
+metric_cols = st.columns(4)
+metric_cols[0].metric("Held-Out ROC-AUC", f"{summary['holdout_metrics']['roc_auc']:.3f}")
+metric_cols[1].metric("Held-Out PR-AUC", f"{summary['holdout_metrics']['pr_auc']:.3f}")
+metric_cols[2].metric("Precision", f"{summary['holdout_metrics']['precision']:.1%}")
+metric_cols[3].metric("Recall", f"{summary['holdout_metrics']['recall']:.1%}")
 
 default_threshold = 0.5
 if bundle is not None and isinstance(bundle, dict) and "threshold" in bundle:
@@ -242,13 +314,6 @@ else:
     scored = local_score(input_df, bundle, threshold)
     backend_used = f"Local model ({MODEL_PATH.name})"
 
-# Dynamic metrics (these change with threshold/input)
-metric_cols = st.columns(4)
-metric_cols[0].metric("Transactions scored", f"{len(scored):,}")
-metric_cols[1].metric("Flagged", f"{int(scored['flag_for_review'].sum()):,}")
-metric_cols[2].metric("Alert rate", f"{scored['flag_for_review'].mean():.1%}")
-metric_cols[3].metric("Avg fraud score", f"{scored['fraud_score'].mean():.3f}")
-
 st.info(f"Scoring backend: {backend_used}")
 
 left, right = st.columns([2, 1])
@@ -266,10 +331,42 @@ with right:
     st.metric("Flagged", f"{int(scored['flag_for_review'].sum()):,}")
     st.metric("Alert rate", f"{scored['flag_for_review'].mean():.1%}")
 
+# HW6-style row-level SHAP
+st.subheader("Decision Transparency (SHAP)")
+row_idx = st.number_input("Row index to explain", min_value=0, max_value=len(input_df)-1, value=0, step=1)
+
+try:
+    pipe = load_pipeline_from_s3()
+    explainer = load_explainer_from_s3()
+
+    x_row = add_features(input_df.iloc[[row_idx]].copy())
+
+    pre = pipe.named_steps.get("preprocess") if hasattr(pipe, "named_steps") else None
+    if pre is None:
+        st.info("Pipeline preprocessor step not found for SHAP.")
+    else:
+        req = getattr(pre, "feature_names_in_", None)
+        if req is not None:
+            for c in req:
+                if c not in x_row.columns:
+                    x_row[c] = np.nan
+            x_row = x_row.loc[:, req]
+
+        x_trans = pre.transform(x_row)
+        x_trans = x_trans.toarray() if hasattr(x_trans, "toarray") else x_trans
+
+        shap_values = explainer(x_trans)
+
+        fig = plt.figure(figsize=(11, 5))
+        shap.plots.waterfall(shap_values[0], max_display=12, show=False)
+        st.pyplot(fig, clear_figure=True)
+except Exception as e:
+    st.info(f"SHAP unavailable: {e}")
+
 st.subheader("Top Model Drivers")
 st.dataframe(top_features, use_container_width=True, hide_index=True)
 
-st.subheader("SHAP Explanation")
+st.subheader("SHAP Static Images")
 if SHAP_WATERFALL_PATH.exists():
     st.image(str(SHAP_WATERFALL_PATH), caption="Local SHAP waterfall plot")
 if SHAP_BAR_PATH.exists():
