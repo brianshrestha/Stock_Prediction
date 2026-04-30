@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import boto3
@@ -61,9 +60,7 @@ def load_runtime_client():
 def load_summary():
     if SUMMARY_PATH.exists():
         return json.loads(SUMMARY_PATH.read_text())
-    return {
-        "holdout_metrics": {"roc_auc": 0.0, "pr_auc": 0.0, "precision": 0.0, "recall": 0.0}
-    }
+    return {"holdout_metrics": {"roc_auc": 0.0, "pr_auc": 0.0, "precision": 0.0, "recall": 0.0}}
 
 
 @st.cache_data
@@ -126,26 +123,55 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def endpoint_score(frame: pd.DataFrame, threshold: float):
+def _parse_endpoint_scores(raw: str) -> list[float]:
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict) and "predictions" in parsed:
+            preds = parsed["predictions"]
+            if preds and isinstance(preds[0], dict):
+                return [float(p.get("score", p.get("probability", 0.0))) for p in preds]
+            return [float(x) for x in preds]
+        if isinstance(parsed, list):
+            out = []
+            for x in parsed:
+                if isinstance(x, dict):
+                    out.append(float(x.get("score", x.get("probability", 0.0))))
+                else:
+                    out.append(float(x))
+            return out
+    except Exception:
+        pass
+
+    parts = [p for p in raw.replace("\n", ",").split(",") if p.strip()]
+    return [float(x) for x in parts]
+
+
+def endpoint_score(frame: pd.DataFrame, threshold: float) -> pd.DataFrame:
     runtime, endpoint = load_runtime_client()
     if runtime is None:
         raise RuntimeError("SageMaker endpoint config missing in Streamlit secrets.")
-    payload = frame.to_dict(orient="records")
+
+    csv_body = frame.to_csv(index=False)
     resp = runtime.invoke_endpoint(
         EndpointName=endpoint,
-        ContentType="application/json",
-        Body=json.dumps(payload),
+        ContentType="text/csv",
+        Accept="application/json",
+        Body=csv_body,
     )
-    body = json.loads(resp["Body"].read().decode("utf-8"))
-    scores = np.array(body if isinstance(body, list) else body.get("scores", []), dtype=float)
+
+    raw = resp["Body"].read().decode("utf-8").strip()
+    scores = _parse_endpoint_scores(raw)
+
+    if len(scores) != len(frame):
+        raise ValueError(f"Prediction length mismatch: got {len(scores)} scores for {len(frame)} rows.")
 
     scored = frame.copy()
     scored["fraud_score"] = scores
-    scored["flag_for_review"] = scores >= threshold
+    scored["flag_for_review"] = scored["fraud_score"] >= threshold
     return scored
 
 
-def local_score(frame: pd.DataFrame, model_bundle: dict, threshold: float):
+def local_score(frame: pd.DataFrame, model_bundle: dict, threshold: float) -> pd.DataFrame:
     feature_columns = model_bundle["feature_columns"]
     model = model_bundle["model"]
     enriched = add_features(frame)
@@ -161,8 +187,8 @@ st.set_page_config(page_title="IEEE Fraud Detection", layout="wide")
 
 summary = load_summary()
 top_features = load_top_features()
-
 bundle = load_model_bundle()
+
 if USE_SAGEMAKER:
     st.success("Using SageMaker endpoint scoring.")
 elif bundle is not None:
@@ -192,18 +218,23 @@ else:
     label = "Sample from professor test transactions"
 
 if input_df.empty:
-    st.warning("No input rows found. Upload a CSV or add `test_transaction.csv` to app data.")
+    st.warning("No input rows found. Upload a CSV or add test_transaction.csv to app data.")
     st.stop()
 
-if USE_SAGEMAKER:
-    scored = endpoint_score(input_df, threshold)
-else:
-    scored = local_score(input_df, bundle, threshold)
+try:
+    scored = endpoint_score(input_df, threshold) if USE_SAGEMAKER else local_score(input_df, bundle, threshold)
+except Exception as e:
+    st.error(f"SageMaker scoring failed: {type(e).__name__}: {e}")
+    st.stop()
 
 left, right = st.columns([2, 1])
 with left:
     st.subheader(label)
-    st.dataframe(scored.sort_values("fraud_score", ascending=False).head(30), use_container_width=True, hide_index=True)
+    st.dataframe(
+        scored.sort_values("fraud_score", ascending=False).head(30),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 with right:
     st.subheader("Review Queue")
