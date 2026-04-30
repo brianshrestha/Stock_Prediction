@@ -1,7 +1,9 @@
+scikit-learn==1.7.2
+shap==0.49.1
+numpy==1.26.4
+scipy==1.15.1
+pandas>=2.0.3,<3.0.0
+boto3==1.40.69
 streamlit
-pandas
-numpy
-boto3
-joblib
 matplotlib
-shap
+joblib
