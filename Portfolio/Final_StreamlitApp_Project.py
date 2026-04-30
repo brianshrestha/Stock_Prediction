@@ -215,11 +215,13 @@ else:
 st.title("IEEE-CIS Fraud Detection")
 st.caption("Final project Streamlit demo using professor-provided transaction files.")
 
+# Dynamic metrics from current scored data
 metric_cols = st.columns(4)
-metric_cols[0].metric("Held-Out ROC-AUC", f"{summary['holdout_metrics']['roc_auc']:.3f}")
-metric_cols[1].metric("Held-Out PR-AUC", f"{summary['holdout_metrics']['pr_auc']:.3f}")
-metric_cols[2].metric("Precision", f"{summary['holdout_metrics']['precision']:.1%}")
-metric_cols[3].metric("Recall", f"{summary['holdout_metrics']['recall']:.1%}")
+metric_cols[0].metric("Transactions scored", f"{len(scored):,}")
+metric_cols[1].metric("Flagged", f"{int(scored['flag_for_review'].sum()):,}")
+metric_cols[2].metric("Alert rate", f"{scored['flag_for_review'].mean():.1%}")
+metric_cols[3].metric("Avg fraud score", f"{scored['fraud_score'].mean():.3f}")
+
 
 default_threshold = 0.5
 if bundle is not None and isinstance(bundle, dict) and "threshold" in bundle:
