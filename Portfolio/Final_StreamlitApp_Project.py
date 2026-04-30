@@ -22,7 +22,6 @@ MODEL_PATH_CANDIDATES = [
 ]
 MODEL_PATH = next((p for p in MODEL_PATH_CANDIDATES if p.exists()), MODEL_PATH_CANDIDATES[0])
 
-SUMMARY_PATH = ROOT / "final_outputs" / "final_summary.json"
 TOP_FEATURES_PATH = ROOT / "final_outputs" / "final_top_features.csv"
 PREDICTIONS_PATH = ROOT / "final_outputs" / "professor_test_predictions.csv"
 SHAP_BAR_PATH = ROOT / "final_figures" / "shap_bar.png"
@@ -60,13 +59,6 @@ def load_runtime_client():
         aws_session_token=_secret("AWS_SESSION_TOKEN"),
     )
     return runtime, endpoint
-
-
-@st.cache_data
-def load_summary():
-    if SUMMARY_PATH.exists():
-        return json.loads(SUMMARY_PATH.read_text())
-    return {"holdout_metrics": {"roc_auc": 0.0, "pr_auc": 0.0, "precision": 0.0, "recall": 0.0}}
 
 
 @st.cache_data
@@ -196,10 +188,8 @@ def local_score(frame: pd.DataFrame, model_bundle, threshold: float) -> pd.DataF
 
 st.set_page_config(page_title="IEEE Fraud Detection", layout="wide")
 
-summary = load_summary()
 top_features = load_top_features()
 
-# Endpoint-first: only load local model when endpoint mode is off
 bundle = None
 if not USE_SAGEMAKER:
     bundle = load_model_bundle()
@@ -214,14 +204,6 @@ else:
 
 st.title("IEEE-CIS Fraud Detection")
 st.caption("Final project Streamlit demo using professor-provided transaction files.")
-
-# Dynamic metrics from current scored data
-metric_cols = st.columns(4)
-metric_cols[0].metric("Transactions scored", f"{len(scored):,}")
-metric_cols[1].metric("Flagged", f"{int(scored['flag_for_review'].sum()):,}")
-metric_cols[2].metric("Alert rate", f"{scored['flag_for_review'].mean():.1%}")
-metric_cols[3].metric("Avg fraud score", f"{scored['fraud_score'].mean():.3f}")
-
 
 default_threshold = 0.5
 if bundle is not None and isinstance(bundle, dict) and "threshold" in bundle:
@@ -259,6 +241,13 @@ if USE_SAGEMAKER:
 else:
     scored = local_score(input_df, bundle, threshold)
     backend_used = f"Local model ({MODEL_PATH.name})"
+
+# Dynamic metrics (these change with threshold/input)
+metric_cols = st.columns(4)
+metric_cols[0].metric("Transactions scored", f"{len(scored):,}")
+metric_cols[1].metric("Flagged", f"{int(scored['flag_for_review'].sum()):,}")
+metric_cols[2].metric("Alert rate", f"{scored['flag_for_review'].mean():.1%}")
+metric_cols[3].metric("Avg fraud score", f"{scored['fraud_score'].mean():.3f}")
 
 st.info(f"Scoring backend: {backend_used}")
 
