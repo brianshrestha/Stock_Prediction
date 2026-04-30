@@ -49,7 +49,9 @@ def _secret2(group: str, key: str, default=None):
     return _secret(key, default)
 
 
-USE_SAGEMAKER = bool(_secret("SAGEMAKER_ENDPOINT"))
+USE_SAGEMAKER = bool(
+    _secret("SAGEMAKER_ENDPOINT") or _secret2("aws_credentials", "AWS_ENDPOINT")
+)
 
 
 @st.cache_resource
@@ -61,7 +63,7 @@ def load_model_bundle():
 
 @st.cache_resource
 def load_runtime_client():
-    endpoint = _secret("SAGEMAKER_ENDPOINT")
+    endpoint = _secret("SAGEMAKER_ENDPOINT") or _secret2("aws_credentials", "AWS_ENDPOINT")
     if not endpoint:
         return None, None
     region = _secret("AWS_DEFAULT_REGION", "us-east-1")
@@ -382,4 +384,5 @@ if not SHAP_WATERFALL_PATH.exists() and not SHAP_BAR_PATH.exists():
         st.pyplot(fig)
 
 st.subheader("Batch Predictions File")
+st.write("USE_SAGEMAKER:", USE_SAGEMAKER)
 st.write(f"Saved professor test predictions: `{PREDICTIONS_PATH}`")
