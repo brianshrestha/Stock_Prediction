@@ -152,7 +152,9 @@ def endpoint_score(frame: pd.DataFrame, threshold: float) -> pd.DataFrame:
     if runtime is None:
         raise RuntimeError("SageMaker endpoint config missing in Streamlit secrets.")
 
-    csv_body = frame.to_csv(index=False)
+    prepared = add_features(frame)
+    csv_body = prepared.to_csv(index=False)
+
     resp = runtime.invoke_endpoint(
         EndpointName=endpoint,
         ContentType="text/csv",
@@ -175,17 +177,12 @@ def endpoint_score(frame: pd.DataFrame, threshold: float) -> pd.DataFrame:
 def local_score(frame: pd.DataFrame, model_bundle, threshold: float) -> pd.DataFrame:
     enriched = add_features(frame)
 
-    # bundle style
     if isinstance(model_bundle, dict) and "model" in model_bundle:
         feature_columns = model_bundle.get("feature_columns")
         model = model_bundle["model"]
-        if feature_columns:
-            X = enriched.reindex(columns=feature_columns)
-        else:
-            X = enriched
+        X = enriched.reindex(columns=feature_columns) if feature_columns else enriched
         local_threshold = float(model_bundle.get("threshold", threshold))
     else:
-        # plain sklearn estimator / pipeline
         model = model_bundle
         X = enriched
         local_threshold = threshold
@@ -201,7 +198,11 @@ st.set_page_config(page_title="IEEE Fraud Detection", layout="wide")
 
 summary = load_summary()
 top_features = load_top_features()
-bundle = load_model_bundle()
+
+# Endpoint-first: only load local model when endpoint mode is off
+bundle = None
+if not USE_SAGEMAKER:
+    bundle = load_model_bundle()
 
 if USE_SAGEMAKER:
     st.success("Using SageMaker endpoint scoring.")
@@ -221,7 +222,7 @@ metric_cols[2].metric("Precision", f"{summary['holdout_metrics']['precision']:.1
 metric_cols[3].metric("Recall", f"{summary['holdout_metrics']['recall']:.1%}")
 
 default_threshold = 0.5
-if isinstance(bundle, dict) and "threshold" in bundle:
+if bundle is not None and isinstance(bundle, dict) and "threshold" in bundle:
     default_threshold = float(bundle["threshold"])
 
 threshold = st.sidebar.slider("Fraud alert threshold", 0.05, 0.90, default_threshold, 0.05)
@@ -238,7 +239,6 @@ if input_df.empty:
     st.warning("No input rows found. Upload a CSV or add test_transaction.csv to app data.")
     st.stop()
 
-# Auto-fallback logic
 scored = None
 backend_used = None
 
@@ -247,12 +247,12 @@ if USE_SAGEMAKER:
         scored = endpoint_score(input_df, threshold)
         backend_used = "SageMaker endpoint"
     except Exception as e:
-        st.warning(f"SageMaker failed, falling back to local model: {type(e).__name__}")
         if bundle is not None:
+            st.warning(f"SageMaker failed, falling back to local model: {type(e).__name__}")
             scored = local_score(input_df, bundle, threshold)
             backend_used = f"Local model fallback ({MODEL_PATH.name})"
         else:
-            st.error(f"SageMaker failed and no local model is available: {e}")
+            st.error(f"SageMaker failed: {e}")
             st.stop()
 else:
     scored = local_score(input_df, bundle, threshold)
