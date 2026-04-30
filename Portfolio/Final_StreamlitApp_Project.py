@@ -56,6 +56,7 @@ def load_model_bundle():
         return None
     return joblib.load(MODEL_PATH)
 
+
 @st.cache_resource
 def load_runtime_client():
     endpoint = _secret("SAGEMAKER_ENDPOINT") or _secret2("aws_credentials", "AWS_ENDPOINT")
@@ -96,10 +97,12 @@ def load_pipeline_from_s3():
     sess = get_boto_session()
     s3 = sess.client("s3")
     bucket = _secret2("aws_credentials", "AWS_BUCKET")
-    key = _secret2("aws_credentials", "PIPELINE_KEY", "fraud-pipeline-deployment/finalized_fraud_model.tar.gz")
+    key = _secret2("aws_credentials", "PIPELINE_KEY", "fraud-pipeline-deployment/model.tar.gz")
 
     if not bucket:
         raise RuntimeError("Missing AWS_BUCKET in secrets.")
+    if not key:
+        raise RuntimeError("Missing PIPELINE_KEY in secrets.")
 
     local_tar = os.path.join(tempfile.gettempdir(), "fraud_pipeline.tar.gz")
     s3.download_file(bucket, key, local_tar)
@@ -116,10 +119,12 @@ def load_explainer_from_s3():
     sess = get_boto_session()
     s3 = sess.client("s3")
     bucket = _secret2("aws_credentials", "AWS_BUCKET")
-    key = _secret2("aws_credentials", "EXPLAINER_KEY", "explainer/explainer_kpca.shap")
+    key = _secret2("aws_credentials", "EXPLAINER_KEY", "")
 
     if not bucket:
         raise RuntimeError("Missing AWS_BUCKET in secrets.")
+    if not key:
+        raise RuntimeError("EXPLAINER_KEY is empty. Configure it in secrets or skip SHAP.")
 
     local_path = os.path.join(tempfile.gettempdir(), "fraud_explainer.shap")
     s3.download_file(bucket, key, local_path)
@@ -263,7 +268,6 @@ st.set_page_config(page_title="IEEE Fraud Detection", layout="wide")
 summary = load_summary()
 top_features = load_top_features()
 
-# Only load local model in local mode
 bundle = None
 if not USE_SAGEMAKER:
     bundle = load_model_bundle()
@@ -279,7 +283,6 @@ else:
 st.title("IEEE-CIS Fraud Detection")
 st.caption("Final project Streamlit demo using professor-provided transaction files.")
 
-# Static held-out metrics
 metric_cols = st.columns(4)
 metric_cols[0].metric("Held-Out ROC-AUC", f"{summary['holdout_metrics']['roc_auc']:.3f}")
 metric_cols[1].metric("Held-Out PR-AUC", f"{summary['holdout_metrics']['pr_auc']:.3f}")
@@ -304,12 +307,16 @@ if input_df.empty:
     st.warning("No input rows found. Upload a CSV or add test_transaction.csv to app data.")
     st.stop()
 
-if USE_SAGEMAKER:
-    scored = endpoint_score(input_df, threshold)
-    backend_used = "SageMaker endpoint"
-else:
-    scored = local_score(input_df, bundle, threshold)
-    backend_used = f"Local model ({MODEL_PATH.name})"
+try:
+    if USE_SAGEMAKER:
+        scored = endpoint_score(input_df, threshold)
+        backend_used = "SageMaker endpoint"
+    else:
+        scored = local_score(input_df, bundle, threshold)
+        backend_used = f"Local model ({MODEL_PATH.name})"
+except Exception as e:
+    st.error(f"Scoring failed: {e}")
+    st.stop()
 
 st.info(f"Scoring backend: {backend_used}")
 
@@ -328,39 +335,42 @@ with right:
     st.metric("Flagged", f"{int(scored['flag_for_review'].sum()):,}")
     st.metric("Alert rate", f"{scored['flag_for_review'].mean():.1%}")
 
-# SHAP on-demand (slow)
 st.subheader("Decision Transparency (SHAP)")
 row_idx = st.number_input("Row index to explain", min_value=0, max_value=len(input_df)-1, value=0, step=1)
 run_shap = st.checkbox("Generate SHAP explanation (slow)", value=False)
 
 if run_shap:
-    try:
-        pipe = load_pipeline_from_s3()
-        explainer = load_explainer_from_s3()
+    explainer_key = _secret2("aws_credentials", "EXPLAINER_KEY", "")
+    if not explainer_key:
+        st.info("SHAP explainer not configured. Add EXPLAINER_KEY in Streamlit secrets.")
+    else:
+        try:
+            pipe = load_pipeline_from_s3()
+            explainer = load_explainer_from_s3()
 
-        x_row = add_features(input_df.iloc[[row_idx]].copy())
+            x_row = add_features(input_df.iloc[[row_idx]].copy())
 
-        pre = pipe.named_steps.get("preprocess") if hasattr(pipe, "named_steps") else None
-        if pre is None:
-            st.info("Pipeline preprocessor step not found for SHAP.")
-        else:
-            req = getattr(pre, "feature_names_in_", None)
-            if req is not None:
-                for c in req:
-                    if c not in x_row.columns:
-                        x_row[c] = np.nan
-                x_row = x_row.loc[:, req]
+            pre = pipe.named_steps.get("preprocess") if hasattr(pipe, "named_steps") else None
+            if pre is None:
+                st.info("Pipeline preprocessor step not found for SHAP.")
+            else:
+                req = getattr(pre, "feature_names_in_", None)
+                if req is not None:
+                    for c in req:
+                        if c not in x_row.columns:
+                            x_row[c] = np.nan
+                    x_row = x_row.loc[:, req]
 
-            x_trans = pre.transform(x_row)
-            x_trans = x_trans.toarray() if hasattr(x_trans, "toarray") else x_trans
+                x_trans = pre.transform(x_row)
+                x_trans = x_trans.toarray() if hasattr(x_trans, "toarray") else x_trans
 
-            shap_values = explainer(x_trans)
+                shap_values = explainer(x_trans)
 
-            fig = plt.figure(figsize=(11, 5))
-            shap.plots.waterfall(shap_values[0], max_display=12, show=False)
-            st.pyplot(fig, clear_figure=True)
-    except Exception as e:
-        st.info(f"SHAP unavailable: {e}")
+                fig = plt.figure(figsize=(11, 5))
+                shap.plots.waterfall(shap_values[0], max_display=12, show=False)
+                st.pyplot(fig, clear_figure=True)
+        except Exception as e:
+            st.info(f"SHAP unavailable: {e}")
 else:
     st.info("Enable SHAP checkbox to compute row-level explanation.")
 
@@ -370,6 +380,6 @@ st.dataframe(top_features, use_container_width=True, hide_index=True)
 st.subheader("Batch Predictions File")
 st.write(f"Saved professor test predictions: `{PREDICTIONS_PATH}`")
 
-# Debug (keep at bottom)
+# Debug
 st.write("USE_SAGEMAKER:", USE_SAGEMAKER)
 st.write("endpoint:", _secret("SAGEMAKER_ENDPOINT"), _secret2("aws_credentials", "AWS_ENDPOINT"))
